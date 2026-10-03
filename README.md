@@ -41,8 +41,9 @@ single run at a different Busbar-equipped org without changing the variable.
 | **Analyze Dependencies** (`analyze-dependencies.yml`) | Builds a component dependency graph + Voronoi package map (JSON + SVG). | read-only |
 | **Audit Permissions** (`audit-permissions.yml`) | Cedar security analysis (permissions, sharing, FLS, flows) → findings JSON + SARIF in the Security tab. | read-only |
 | **Query Org** (`query-org.yml`) | Runs one declarative `sf` action (default: a SOQL query) inside the **nono** capability sandbox (Landlock-confined on Linux) with a full audit trail. | read-only |
+| **Busbar Delivery** (`busbar-delivery.yml`) | Runs in a **provisioned fork**: the Busbar Hub dispatches it after creating the fork's ephemeral scratch org and GitHub Environment `org`. Authenticates by OIDC against that org's per-run trust rule, confirms the org, and writes a job summary. | read-only |
 
-All six are **on-demand** (`workflow_dispatch`) — kick any of them off from the
+All seven are **on-demand** (`workflow_dispatch`) — kick any of them off from the
 GitHub **Actions** tab, or from the Busbar console.
 
 ## Run it

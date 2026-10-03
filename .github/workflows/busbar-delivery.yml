@@ -1,0 +1,180 @@
+name: Busbar Delivery
+
+# The DELIVERY workflow for a fork of org-base: the first thing that runs in the
+# ephemeral scratch org Busbar provisions for that fork.
+#
+# HOW IT GETS HERE. Forking org-base triggers Busbar provisioning
+# (busbar-actions/sf-org-provision, provision.yml). That runner creates a scratch
+# org, installs Busbar core + busbar-github, and publishes ONE trust rule into the
+# new org. When it reports Trusted, the Hub (Salesforce) creates the GitHub
+# Environment `org` on this fork, sets its NON-secret variables
+# (SF_INSTANCE_URL, SF_ORG_ID, and SF_USERNAME once busbar-github ships it), and
+# `workflow_dispatch`es THIS workflow on the fork's ref.
+#
+# WHAT THE TRUST RULE PINS — this file must present exactly these OIDC claims,
+# and they are NOT editable here without breaking the exchange:
+#   repository  = this fork (owner/repo)       ← automatic: the run's own repo
+#   environment = org                          ← `environment: org` below
+#   ref         = the ref provisioning ran for ← the Hub dispatches on that ref
+#   workflow    = busbar-delivery              ← THIS FILE'S BASENAME. Matched as
+#                 the basename of `workflow_ref` (claim source `either`), never
+#                 `job_workflow_ref` alone. Renaming this file means changing the
+#                 runner's BUSBAR_DELIVERY_WORKFLOW variable to the new basename.
+# event_name is not pinned; run-as is the scratch org's admin (the rule has no
+# subject alias); the rule's orgType is `Any`, so the Scratch org matches.
+#
+# ZERO STORED SECRETS. No secret is read. busbar-actions/sf-cli mints its own
+# short-lived Salesforce session in-process from this job's GitHub OIDC token,
+# holds it in the supervisor (the managed `sf` only ever sees a placeholder),
+# never writes it to GITHUB_ENV, and revokes + zeroizes it when the step ends —
+# on success AND failure. There is no org-auth handoff and nothing to revoke by
+# hand.
+#
+# WHAT IT DELIVERS. org-base is a read-only context sidecar, not an SFDX project
+# (no sfdx-project.json, no source to deploy), so delivery here is the minimal
+# meaningful proof: authenticate by OIDC, query Organization, check it is the
+# org the Hub said it provisioned, and publish that in the job summary. When a
+# fork adds deployable source, swap the query for a `project_deploy` SfAction.
+
+on:
+  workflow_dispatch:
+
+# Nothing at the workflow level; the one job grants exactly what it needs.
+permissions: {}
+
+concurrency:
+  group: busbar-delivery-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  deliver:
+    name: Deliver to the ephemeral org (OIDC, no stored secrets)
+    runs-on: ubuntu-latest # Linux → Landlock-confined sf-cli sandbox
+    timeout-minutes: 20
+
+    # REQUIRED, and part of the authorization decision: it puts
+    # `environment: org` into this job's OIDC token (the trust rule pins it),
+    # and it is the only way this job can see the Environment's variables.
+    environment: org
+
+    permissions:
+      id-token: write # the OIDC token sf-cli exchanges for a Salesforce session
+      contents: read
+
+    env:
+      # Environment variables set by the Hub. Non-secret identifiers only.
+      SF_INSTANCE_URL: ${{ vars.SF_INSTANCE_URL }}
+      EXPECTED_ORG_ID: ${{ vars.SF_ORG_ID }}
+      EXPECTED_USERNAME: ${{ vars.SF_USERNAME }}
+      # (runner.temp is not available to job-level env, so result paths are
+      # set per step.)
+
+    steps:
+      - name: Preflight — the Hub configured this Environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${SF_INSTANCE_URL}" =~ ^https://[A-Za-z0-9.-]+$ ]]; then
+            echo "::error::The 'org' Environment has no usable SF_INSTANCE_URL (got '${SF_INSTANCE_URL}'). It is set by the Busbar Hub once provisioning reports Trusted — this workflow is meant to be dispatched by the Hub, not run on a fork that was never provisioned."
+            exit 1
+          fi
+          [[ -n "${EXPECTED_ORG_ID}" ]] \
+            || echo "::warning::SF_ORG_ID is not set on the 'org' Environment; the org-id cross-check will be skipped."
+          echo "Target org      : ${SF_INSTANCE_URL}"
+          echo "Presenting OIDC : repository=${GITHUB_REPOSITORY} ref=${GITHUB_REF} environment=org workflow=${GITHUB_WORKFLOW_REF}"
+
+      # OIDC token exchange + one read-only SfAction, in the capability sandbox.
+      # target-instance is also the OIDC audience (sf-cli's default), which is
+      # the org's My Domain URL — the only audience the org accepts.
+      - name: Authenticate by OIDC and query the org
+        id: query
+        uses: busbar-actions/sf-cli@main
+        with:
+          target-instance: ${{ vars.SF_INSTANCE_URL }}
+          action: >-
+            {"action":"data_query","target_org":"delivery-org",
+            "soql":"SELECT Id, Name, OrganizationType, IsSandbox FROM Organization"}
+          output: ${{ runner.temp }}/busbar-delivery/organization.json
+          audit-out: ${{ runner.temp }}/busbar-delivery/sandbox-audit.json
+          artifact-name: busbar-delivery-sandbox-audit
+
+      - name: Verify the org and write the job summary
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          QUERY_OUTCOME: ${{ steps.query.outcome }}
+          RESULT_FILE: ${{ runner.temp }}/busbar-delivery/organization.json
+        run: |
+          set -euo pipefail
+
+          if [[ "${QUERY_OUTCOME}" != "success" || ! -s "${RESULT_FILE}" ]]; then
+            {
+              echo "## Busbar delivery failed"
+              echo
+              echo "Could not authenticate to \`${SF_INSTANCE_URL}\` by GitHub OIDC, or the query failed."
+              echo "If the log shows a trust or \"pending trust\" denial, this run's claims did not match the rule provisioning published:"
+              echo
+              echo "| Claim | This run presented |"
+              echo "|---|---|"
+              echo "| repository | \`${GITHUB_REPOSITORY}\` |"
+              echo "| ref | \`${GITHUB_REF}\` |"
+              echo "| environment | \`org\` |"
+              echo "| workflow_ref | \`${GITHUB_WORKFLOW_REF}\` |"
+            } >> "${GITHUB_STEP_SUMMARY}"
+            echo "::error::Delivery did not complete (sf-cli outcome: ${QUERY_OUTCOME})."
+            exit 1
+          fi
+
+          record="$(jq -c '(.result.records // .raw.result.records // [])[0] // empty' "${RESULT_FILE}")"
+          [[ -n "${record}" ]] || { echo "::error::The Organization query returned no row."; exit 1; }
+          org_id="$(jq -r '.Id' <<< "${record}")"
+          org_name="$(jq -r '.Name' <<< "${record}")"
+          org_type="$(jq -r '.OrganizationType // "unknown"' <<< "${record}")"
+
+          # The Hub told this Environment which org it provisioned. Landing in any
+          # other org is a failure, not a detail. Compare on the 15-char id.
+          id_check="skipped (SF_ORG_ID not set)"
+          if [[ -n "${EXPECTED_ORG_ID}" ]]; then
+            if [[ "${org_id:0:15}" != "${EXPECTED_ORG_ID:0:15}" ]]; then
+              echo "::error::Authenticated into org ${org_id}, but the Hub provisioned ${EXPECTED_ORG_ID} for this fork."
+              exit 1
+            fi
+            id_check="matches SF_ORG_ID"
+          fi
+
+          {
+            echo "## Delivered to org \`${org_id}\` (${SF_INSTANCE_URL}) — no stored secrets"
+            echo
+            echo "This workflow exchanged its GitHub OIDC token for a short-lived Salesforce session,"
+            echo "used it, and revoked it. No Salesforce credential exists in this repository."
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Org | ${org_name} (\`${org_id}\`, ${org_type}) |"
+            echo "| Instance | ${SF_INSTANCE_URL} |"
+            echo "| Org id check | ${id_check} |"
+            if [[ -n "${EXPECTED_USERNAME}" ]]; then echo "| Run-as | \`${EXPECTED_USERNAME}\` |"; fi
+            echo "| Authorized by | repository \`${GITHUB_REPOSITORY}\` · ref \`${GITHUB_REF}\` · environment \`org\` · workflow \`${GITHUB_WORKFLOW_REF}\` |"
+            echo "| Credential | GitHub OIDC → RFC 8693 token exchange, held in the sf-cli sandbox, revoked at step end |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          echo "✓ delivered to ${org_name} (${org_id}) at ${SF_INSTANCE_URL}"
+
+      # sf-cli revokes its own session in-process; this proves no session was
+      # handed to the job environment, where it would outlive that revoke.
+      - name: Assert no Salesforce session reached the job environment
+        if: always()
+        shell: bash
+        env:
+          RESULT_FILE: ${{ runner.temp }}/busbar-delivery/organization.json
+        run: |
+          set -euo pipefail
+          leaked=''
+          for name in SF_ACCESS_TOKEN SF_REFRESH_TOKEN SF_AUTH_URL SFDX_AUTH_URL; do
+            [[ -z "$(printenv "${name}" || true)" ]] || leaked="${leaked} ${name}"
+          done
+          if [[ -n "${leaked}" ]]; then
+            echo "::error::SECURITY: Salesforce session state is in the job environment:${leaked}. Delivery must never hand a token off."
+            exit 1
+          fi
+          rm -f "${RESULT_FILE}"
+          echo "✓ no Salesforce session in the job environment"

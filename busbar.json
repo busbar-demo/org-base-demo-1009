@@ -71,6 +71,14 @@
       "blurb": "One declarative sf action in the nono capability sandbox.",
       "trigger": "workflow_dispatch",
       "writesToOrg": false
+    },
+    {
+      "id": "busbar-delivery",
+      "file": ".github/workflows/busbar-delivery.yml",
+      "name": "Busbar Delivery",
+      "blurb": "Dispatched by the Hub into a provisioned fork: OIDC-authenticates to the fork's ephemeral org (Environment `org`), confirms the org, and reports it in the job summary.",
+      "trigger": "workflow_dispatch",
+      "writesToOrg": false
     }
   ]
 }
