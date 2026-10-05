@@ -90,6 +90,11 @@ jobs:
         id: query
         uses: busbar-actions/sf-cli@main
         with:
+          # The binary release, pinned like busbar-actions/sf-org-provision does.
+          # actions-dist's "latest" (0.0.31) predates the busbar-sandbox fix that
+          # admits scratch/sandbox My Domain hosts (*.scratch.my.salesforce.com),
+          # so on "latest" the proxy refuses the very org this workflow targets.
+          version: nightly
           target-instance: ${{ vars.SF_INSTANCE_URL }}
           action: >-
             {"action":"data_query","target_org":"delivery-org",
