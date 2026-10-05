@@ -89,6 +89,11 @@ jobs:
       - name: Authenticate by OIDC and query the org
         id: query
         uses: busbar-actions/sf-cli@main
+        env:
+          # The nightly sf-cli's request policy reads this repository (its
+          # .busbar/policies, at the commit this run names) before it grants
+          # the Salesforce session anything. The job's own token, contents:read.
+          GITHUB_TOKEN: ${{ github.token }}
         with:
           # The binary release, pinned like busbar-actions/sf-org-provision does.
           # actions-dist's "latest" (0.0.31) predates the busbar-sandbox fix that
